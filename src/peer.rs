@@ -176,6 +176,16 @@ impl PeerMap {
         self.map.read().await.get(id).cloned()
     }
 
+    /// Re-keys an in-memory peer entry after its id was renamed in the database,
+    /// so routing and freshness checks immediately follow the new id.
+    #[inline]
+    pub(crate) async fn move_peer(&self, old_id: &str, new_id: &str) {
+        let mut w = self.map.write().await;
+        if let Some(p) = w.remove(old_id) {
+            w.insert(new_id.to_owned(), p);
+        }
+    }
+
     #[inline]
     pub(crate) async fn is_in_memory(&self, id: &str) -> bool {
         self.map.read().await.contains_key(id)

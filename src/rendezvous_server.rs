@@ -8,7 +8,7 @@ use hbb_common::{
     futures::future::join_all,
     futures_util::{
         sink::SinkExt,
-        stream::{SplitSink, StreamExt},
+        stream::{SplitSink, SplitStream, StreamExt},
     },
     log,
     protobuf::{Message as _, MessageField},
@@ -16,14 +16,14 @@ use hbb_common::{
         register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
         *,
     },
-    tcp::FramedStream,
+    tcp::{Encrypt, FramedStream, KxTranscript, KX_PARAMS_DOMAIN, KX_VERSION_LATEST},
     timeout,
     tokio::{
         self,
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
         sync::{mpsc, Mutex},
-        time::{interval, Duration},
+        time::{interval, Duration, MissedTickBehavior},
     },
     tokio_util::codec::Framed,
     try_into_v4,
@@ -31,7 +31,7 @@ use hbb_common::{
     AddrMangle, ResultType,
 };
 use ipnetwork::Ipv4Network;
-use sodiumoxide::crypto::sign;
+use sodiumoxide::crypto::{box_, sign};
 use std::{
     collections::{HashMap, VecDeque},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -50,12 +50,73 @@ enum Data {
 const REG_TIMEOUT: i64 = 30_000;
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
+type TcpStreamSource = SplitStream<Framed<TcpStream, BytesCodec>>;
+type WsSource = SplitStream<tokio_tungstenite::WebSocketStream<TcpStream>>;
+
 enum Sink {
     TcpStream(TcpStreamSink),
     Ws(WsSink),
 }
+
+impl Sink {
+    async fn send_bytes(&mut self, bytes: Bytes) -> ResultType<()> {
+        match self {
+            Sink::TcpStream(s) => s.send(bytes).await?,
+            Sink::Ws(s) => s.send(tungstenite::Message::Binary(bytes)).await?,
+        }
+        Ok(())
+    }
+}
+
+enum Source {
+    TcpStream(TcpStreamSource),
+    Ws(WsSource),
+}
+
+impl Source {
+    /// The next data frame: `None` at end of stream, `Err` on a read failure.
+    /// Non-data WebSocket frames are consumed here; tungstenite answers pings itself.
+    async fn next_frame(&mut self) -> Option<ResultType<BytesMut>> {
+        match self {
+            Source::TcpStream(s) => s.next().await.map(|r| r.map_err(Into::into)),
+            Source::Ws(s) => loop {
+                match s.next().await {
+                    Some(Ok(tungstenite::Message::Binary(bytes))) => {
+                        return Some(Ok(BytesMut::from(&bytes[..])));
+                    }
+                    Some(Ok(tungstenite::Message::Close(_))) | None => return None,
+                    Some(Ok(_)) => continue,
+                    Some(Err(err)) => return Some(Err(err.into())),
+                }
+            },
+        }
+    }
+}
+
+/// The write half of a connection, handed to whoever needs to deliver a message to
+/// it. The connection task owns the sink and the cipher state and encrypts what
+/// arrives here; being cloneable, it survives being sent to, so map entries outlive
+/// individual deliveries and are only dropped when the connection closes. Bounded
+/// with a capacity of [`MAX_CONN_QUEUE`]: a peer that stopped draining its socket
+/// must not make the routers pile up memory on its behalf, so a full queue drops.
+type ConnSender = mpsc::Sender<Bytes>;
+
 type Sender = mpsc::UnboundedSender<Data>;
 type Receiver = mpsc::UnboundedReceiver<Data>;
+// A TCP-mediator client stops re-registering once its key is confirmed and only echoes
+// the empty frames it receives, so the heartbeat has to come from this side. 15s stays
+// well inside both the client's bail-out (keep_alive 60s * 3/2) and the connection read
+// timeout below; every frame received in turn refreshes the peer's registration time.
+const MEDIATOR_HEARTBEAT_SECS: u64 = 15;
+const MEDIATOR_KEEP_ALIVE_SECS: i32 = 60;
+// Nothing may sit silent on a connection for longer than this. It bounds the wait for
+// any one frame — including the key-exchange reply, which the client may delay by
+// fetching the server key first (it reads our offer with an 18s timeout) — and it is
+// what reaps a mediator that stopped echoing the heartbeat.
+const CONN_READ_TIMEOUT_MS: u64 = 30_000;
+// Sanity bounds for routed ICE candidates; the frame bound already caps the message.
+const MAX_ICE_SESSION_KEY_LEN: usize = 256;
+const MAX_ICE_CANDIDATE_LEN: usize = 2048;
 static ROTATION_RELAY_SERVER: AtomicUsize = AtomicUsize::new(0);
 type RelayServers = Vec<String>;
 const CHECK_RELAY_TIMEOUT: u64 = 3_000;
@@ -81,6 +142,131 @@ fn validate_relay_response(uuid: &str, relay_server: &str) -> Result<(), &'stati
         return Ok(());
     }
     validate_relay_uuid(uuid)
+}
+
+// The HTTP tunnel relays to the API server on loopback: the request frame is already
+// capped by MAX_MESSAGE, and the response body is capped so a runaway origin cannot
+// balloon the relayed frame. An origin that cannot answer inside the client's overall
+// budget (CONNECT_TIMEOUT + READ_TIMEOUT) is cut off here first.
+const MAX_HTTP_PROXY_BODY: usize = 16 << 20;
+const HTTP_PROXY_TIMEOUT_MS: u64 = 25_000;
+// Upper bound on queued outbound frames per connection before routed messages for it
+// are dropped: a peer that stopped draining its socket must not make the routers pile
+// up unbounded memory on its behalf.
+const MAX_CONN_QUEUE: usize = 256;
+
+/// Queue a message onto a connection task, which writes it out (and encrypts it, when
+/// a key exchange completed) from its own loop. Never blocks: the routers deliver to
+/// many connections from shared paths, so a connection whose queue is full — it has
+/// stopped draining its socket — loses this message instead of stalling them.
+#[inline]
+fn send_to_conn(conn_tx: &ConnSender, msg: RendezvousMessage) {
+    if let Ok(bytes) = msg.write_to_bytes() {
+        match conn_tx.try_send(Bytes::from(bytes)) {
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                log::warn!("Dropping a message for a connection with a full queue");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                log::debug!("Dropping a message for a closed connection");
+            }
+            Ok(()) => {}
+        }
+    }
+}
+
+/// The server's key exchange offer: a fresh ephemeral X25519 keypair whose public key
+/// is signed with the server key and — the high bit flags a server that signs —
+/// accompanied by a signature over exactly those bytes plus the version (KxParams).
+/// This is what the client's key exchange expects to read as the first frame.
+fn build_kx_offer(
+    sk: &sign::SecretKey,
+) -> ResultType<(RendezvousMessage, box_::SecretKey, [u8; 32])> {
+    let (eph_pk, eph_sk) = box_::gen_keypair();
+    let mut pk = eph_pk.0;
+    pk[31] |= 0x80;
+    let params = KxParams {
+        pk: pk.to_vec().into(),
+        version: KX_VERSION_LATEST,
+        ..Default::default()
+    };
+    let mut to_sign = KX_PARAMS_DOMAIN.to_vec();
+    to_sign.extend_from_slice(&params.write_to_bytes()?);
+    let mut ex = KeyExchange::new();
+    ex.keys = vec![sign::sign(&pk, sk).into()];
+    ex.version = KX_VERSION_LATEST;
+    ex.signed_params = sign::sign(&to_sign, sk).into();
+    let mut msg = RendezvousMessage::new();
+    msg.set_key_exchange(ex);
+    Ok((msg, eph_sk, pk))
+}
+
+/// Completes the exchange from the client's reply: unseal the shared secretbox key and
+/// build the connection's cipher state. The server is the responder — it sends under the
+/// responder subkey and receives under the initiator's — while a version-0 client uses
+/// one key in both directions. A single `Encrypt` carries both directions' keys and
+/// counters, mirroring the client's own instance.
+fn complete_kx(
+    ex: &KeyExchange,
+    eph_sk: &box_::SecretKey,
+    responder_pk: &[u8; 32],
+) -> ResultType<Encrypt> {
+    if ex.keys.len() != 2 {
+        bail!("key exchange reply carries {} keys", ex.keys.len());
+    }
+    let picked = ex.version;
+    if picked > KX_VERSION_LATEST {
+        bail!("key exchange reply picked an unknown version {}", picked);
+    }
+    let key = Encrypt::decode(&ex.keys[1], &ex.keys[0], eph_sk)?;
+    let enc = if picked == 0 {
+        Encrypt::new(key)
+    } else {
+        Encrypt::new_split(
+            key,
+            false,
+            &KxTranscript {
+                initiator_pk: &ex.keys[0],
+                responder_pk,
+                advertised: KX_VERSION_LATEST,
+                picked,
+            },
+        )?
+    };
+    Ok(enc)
+}
+
+/// Headers that belong to a single transport connection; the tunnel terminates them on
+/// both sides and lets reqwest derive its own.
+fn is_hop_by_hop_header(name: &str) -> bool {
+    matches!(
+        name,
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
+/// The tunnel can only append an absolute path to a fixed loopback origin: reject
+/// anything that does not start with a single '/', carries control characters, or is
+/// over-long, so no request line can shift the destination or smuggle a second one.
+fn validate_proxy_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 8192
+        && path.starts_with('/')
+        && !path.starts_with("//")
+        && path.bytes().all(|b| b >= b' ' && b != 0x7f)
+}
+
+fn allowed_proxy_method(method: &str) -> bool {
+    matches!(
+        method,
+        "GET" | "POST" | "PUT" | "DELETE" | "PATCH" | "HEAD" | "OPTIONS"
+    )
 }
 
 // An online query for about 5000 ids is the largest message a client sends here.
@@ -136,11 +322,20 @@ struct Inner {
     mask: Option<Ipv4Network>,
     local_ip: String,
     sk: Option<sign::SecretKey>,
+    /// Loopback origin of the API server (the rendezvous port minus two), the only
+    /// destination the HTTP proxy tunnel forwards to.
+    api_origin: String,
 }
 
 #[derive(Clone)]
 pub struct RendezvousServer {
-    tcp_punch: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
+    /// Punch sockets by address: a requester keeps its socket across the whole punch
+    /// sequence and the WebRTC ICE trickle after it, so entries are only removed when
+    /// the connection closes.
+    tcp_punch: Arc<Mutex<HashMap<SocketAddr, ConnSender>>>,
+    /// Write halves of the TCP-mediator connections, by peer id. A peer registered
+    /// over TCP has no usable UDP address, so messages routed to it go through here.
+    mediators: Arc<Mutex<HashMap<String, ConnSender>>>,
     pm: PeerMap,
     tx: Sender,
     relay_servers: Arc<RelayServers>,
@@ -196,6 +391,7 @@ impl RendezvousServer {
         };
         let mut rs = Self {
             tcp_punch: Arc::new(Mutex::new(HashMap::new())),
+            mediators: Arc::new(Mutex::new(HashMap::new())),
             pm,
             tx: tx.clone(),
             relay_servers: Default::default(),
@@ -208,6 +404,7 @@ impl RendezvousServer {
                 sk,
                 mask,
                 local_ip,
+                api_origin: format!("http://127.0.0.1:{}", port - 2),
             }),
         };
         log::info!("mask: {:?}", rs.inner.mask);
@@ -315,8 +512,17 @@ impl RendezvousServer {
         key: &str,
     ) -> LoopFailure {
         let mut timer_check_relay = interval(Duration::from_millis(CHECK_RELAY_TIMEOUT));
+        // Safety net for the connection-task cleanup: a connection that died without
+        // unwinding (panic) leaves its entries behind, and a closed channel is the only
+        // signal that survives it. The first tick fires at startup with nothing to sweep.
+        let mut timer_sweep = interval(Duration::from_secs(MEDIATOR_HEARTBEAT_SECS));
+        timer_sweep.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             tokio::select! {
+                _ = timer_sweep.tick() => {
+                    self.mediators.lock().await.retain(|_, tx| !tx.is_closed());
+                    self.tcp_punch.lock().await.retain(|_, tx| !tx.is_closed());
+                }
                 _ = timer_check_relay.tick() => {
                     if self.relay_servers0.len() > 1 {
                         let rs = self.relay_servers0.clone();
@@ -408,7 +614,7 @@ impl RendezvousServer {
         bytes: &BytesMut,
         addr: SocketAddr,
         socket: &mut FramedSocket,
-        key: &str,
+        _key: &str,
     ) -> ResultType<()> {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             match msg_in.union {
@@ -513,14 +719,14 @@ impl RendezvousServer {
                     });
                     socket.send(&msg_out, addr).await?
                 }
-                Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
+                Some(rendezvous_message::Union::PunchHoleRequest(_)) => {
                     // UDP PunchHoleRequest is intentionally unsupported.
                     // The supported client path sends PunchHoleRequest over TCP/WS.
                 }
-                Some(rendezvous_message::Union::PunchHoleSent(phs)) => {
+                Some(rendezvous_message::Union::PunchHoleSent(_)) => {
                     // UDP PunchHoleSent is intentionally unsupported to avoid UDP reflection/amplification
                 }
-                Some(rendezvous_message::Union::LocalAddr(la)) => {
+                Some(rendezvous_message::Union::LocalAddr(_)) => {
                     // UDP LocalAddr is intentionally unsupported to avoid UDP reflection/amplification
                 }
                 Some(rendezvous_message::Union::ConfigureUpdate(mut cu)) => {
@@ -564,18 +770,21 @@ impl RendezvousServer {
     async fn handle_tcp(
         &mut self,
         bytes: &[u8],
-        sink: &mut Option<Sink>,
+        conn_tx: &ConnSender,
         addr: SocketAddr,
         key: &str,
         ws: bool,
+        mediator_id: &mut Option<String>,
     ) -> bool {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             match msg_in.union {
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
-                    // there maybe several attempt, so sink can be none
-                    if let Some(sink) = sink.take() {
-                        self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
-                    }
+                    // Register the punch socket for the whole punch sequence and the ICE
+                    // trickle after it; the entry stays until the connection closes.
+                    self.tcp_punch
+                        .lock()
+                        .await
+                        .insert(try_into_v4(addr), conn_tx.clone());
                     allow_err!(self.handle_tcp_punch_hole_request(addr, ph, key, ws).await);
                     return true;
                 }
@@ -587,10 +796,10 @@ impl RendezvousServer {
                         );
                         return false;
                     }
-                    // there maybe several attempt, so sink can be none
-                    if let Some(sink) = sink.take() {
-                        self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
-                    }
+                    self.tcp_punch
+                        .lock()
+                        .await
+                        .insert(try_into_v4(addr), conn_tx.clone());
                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
                         let mut msg_out = RendezvousMessage::new();
                         rf.socket_addr = AddrMangle::encode(addr).into();
@@ -625,13 +834,18 @@ impl RendezvousServer {
                         }
                     }
                     msg_out.set_relay_response(rr);
-                    allow_err!(self.send_to_tcp_sync(msg_out, addr_b).await);
+                    // A's request socket stays registered, so keep the entry rather
+                    // than removing it after this one delivery.
+                    self.send_to_tcp(msg_out, addr_b).await;
+                    return true;
                 }
                 Some(rendezvous_message::Union::PunchHoleSent(phs)) => {
-                    allow_err!(self.handle_hole_sent(phs, addr, None).await);
+                    allow_err!(self.handle_hole_sent(phs, addr).await);
+                    return true;
                 }
                 Some(rendezvous_message::Union::LocalAddr(la)) => {
-                    allow_err!(self.handle_local_addr(la, addr, None).await);
+                    allow_err!(self.handle_local_addr(la, addr).await);
+                    return true;
                 }
                 Some(rendezvous_message::Union::TestNatRequest(tar)) => {
                     let mut msg_out = RendezvousMessage::new();
@@ -646,21 +860,27 @@ impl RendezvousServer {
                         res.cu = MessageField::from_option(Some(cu));
                     }
                     msg_out.set_test_nat_response(res);
-                    Self::send_to_sink(sink, msg_out).await;
+                    send_to_conn(conn_tx, msg_out);
+                    return true;
                 }
-                Some(rendezvous_message::Union::RegisterPk(_)) => {
-                    let res = register_pk_response::Result::NOT_SUPPORT;
-                    let mut msg_out = RendezvousMessage::new();
-                    msg_out.set_register_pk_response(RegisterPkResponse {
-                        result: res.into(),
-                        ..Default::default()
-                    });
-                    Self::send_to_sink(sink, msg_out).await;
+                Some(rendezvous_message::Union::RegisterPk(rk)) => {
+                    self.handle_register_pk(rk, conn_tx, addr, mediator_id).await;
+                    return true;
+                }
+                Some(rendezvous_message::Union::IceCandidate(ic)) => {
+                    allow_err!(self.handle_ice_candidate(ic).await);
+                    return true;
+                }
+                Some(rendezvous_message::Union::HttpProxyRequest(req)) => {
+                    self.handle_http_proxy_request(req, conn_tx.clone()).await;
+                    return true;
                 }
                 _ => {}
             }
         }
-        false
+        // A long-lived connection (mediator, punch or proxy) survives messages it does
+        // not know; the read timeout closes it if the peer goes silent.
+        true
     }
 
     #[inline]
@@ -708,68 +928,44 @@ impl RendezvousServer {
     }
 
     #[inline]
-    async fn handle_hole_sent<'a>(
-        &mut self,
-        phs: PunchHoleSent,
-        addr: SocketAddr,
-        socket: Option<&'a mut FramedSocket>,
-    ) -> ResultType<()> {
+    async fn handle_hole_sent(&mut self, phs: PunchHoleSent, addr: SocketAddr) -> ResultType<()> {
         // punch hole sent from B, tell A that B is ready to be connected
         let addr_a = AddrMangle::decode(&phs.socket_addr);
-        log::debug!(
-            "{} punch hole response to {:?} from {:?}",
-            if socket.is_none() { "TCP" } else { "UDP" },
-            &addr_a,
-            &addr
-        );
+        log::debug!("punch hole response to {:?} from {:?}", &addr_a, &addr);
         let mut msg_out = RendezvousMessage::new();
         let mut p = PunchHoleResponse {
             socket_addr: AddrMangle::encode(addr).into(),
-            pk: self.get_pk(&phs.version, phs.id).await,
+            pk: self.get_pk(&phs.version, phs.id.clone()).await,
             relay_server: phs.relay_server.clone(),
+            socket_addr_v6: phs.socket_addr_v6.clone(),
+            upnp_port: phs.upnp_port,
+            webrtc_sdp_answer: phs.webrtc_sdp_answer.clone(),
             ..Default::default()
         };
         if let Ok(t) = phs.nat_type.enum_value() {
             p.set_nat_type(t);
         }
         msg_out.set_punch_hole_response(p);
-        if let Some(socket) = socket {
-            socket.send(&msg_out, addr_a).await?;
-        } else {
-            self.send_to_tcp(msg_out, addr_a).await;
-        }
+        self.send_to_tcp(msg_out, addr_a).await;
         Ok(())
     }
 
     #[inline]
-    async fn handle_local_addr<'a>(
-        &mut self,
-        la: LocalAddr,
-        addr: SocketAddr,
-        socket: Option<&'a mut FramedSocket>,
-    ) -> ResultType<()> {
+    async fn handle_local_addr(&mut self, la: LocalAddr, addr: SocketAddr) -> ResultType<()> {
         // relay local addrs of B to A
         let addr_a = AddrMangle::decode(&la.socket_addr);
-        log::debug!(
-            "{} local addrs response to {:?} from {:?}",
-            if socket.is_none() { "TCP" } else { "UDP" },
-            &addr_a,
-            &addr
-        );
+        log::debug!("local addrs response to {:?} from {:?}", &addr_a, &addr);
         let mut msg_out = RendezvousMessage::new();
         let mut p = PunchHoleResponse {
             socket_addr: la.local_addr.clone(),
-            pk: self.get_pk(&la.version, la.id).await,
+            pk: self.get_pk(&la.version, la.id.clone()).await,
             relay_server: la.relay_server,
+            socket_addr_v6: la.socket_addr_v6,
             ..Default::default()
         };
         p.set_is_local(true);
         msg_out.set_punch_hole_response(p);
-        if let Some(socket) = socket {
-            socket.send(&msg_out, addr_a).await?;
-        } else {
-            self.send_to_tcp(msg_out, addr_a).await;
-        }
+        self.send_to_tcp(msg_out, addr_a).await;
         Ok(())
     }
 
@@ -780,7 +976,7 @@ impl RendezvousServer {
         ph: PunchHoleRequest,
         key: &str,
         ws: bool,
-    ) -> ResultType<(RendezvousMessage, Option<SocketAddr>)> {
+    ) -> ResultType<(RendezvousMessage, Option<String>)> {
         let mut ph = ph;
         if !key.is_empty() && ph.licence_key != key {
             log::warn!("Authentication failed from {} for peer {} - invalid key", addr, ph.id);
@@ -810,7 +1006,7 @@ impl RendezvousServer {
                 });
                 return Ok((msg_out, None));
             }
-            
+
             // record punch hole request (from addr -> peer id/peer_addr)
             record_punch_req(
                 try_into_v4(addr).ip().to_string(),
@@ -849,6 +1045,7 @@ impl RendezvousServer {
                 msg_out.set_fetch_local_addr(FetchLocalAddr {
                     socket_addr,
                     relay_server,
+                    socket_addr_v6: ph.socket_addr_v6,
                     ..Default::default()
                 });
             } else {
@@ -862,10 +1059,17 @@ impl RendezvousServer {
                     socket_addr,
                     nat_type: ph.nat_type,
                     relay_server,
+                    udp_port: ph.udp_port,
+                    force_relay: ph.force_relay,
+                    upnp_port: ph.upnp_port,
+                    socket_addr_v6: ph.socket_addr_v6,
+                    webrtc_sdp_offer: ph.webrtc_sdp_offer,
                     ..Default::default()
                 });
             }
-            Ok((msg_out, Some(peer_addr)))
+            // The message is routed to B by id: over its TCP-mediator conn when it
+            // registered one, else to the UDP address it registered from.
+            Ok((msg_out, Some(id)))
         } else {
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
@@ -905,39 +1109,39 @@ impl RendezvousServer {
         Ok(())
     }
 
+    /// Queue a message onto a peer's registered punch socket. The entry is kept — a
+    /// requester holds its socket across the whole punch sequence and the ICE trickle
+    /// after it — and dies with the connection.
     #[inline]
     async fn send_to_tcp(&mut self, msg: RendezvousMessage, addr: SocketAddr) {
-        let mut tcp = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
-        tokio::spawn(async move {
-            Self::send_to_sink(&mut tcp, msg).await;
-        });
-    }
-
-    #[inline]
-    async fn send_to_sink(sink: &mut Option<Sink>, msg: RendezvousMessage) {
-        if let Some(sink) = sink.as_mut() {
-            if let Ok(bytes) = msg.write_to_bytes() {
-                match sink {
-                    Sink::TcpStream(s) => {
-                        allow_err!(s.send(Bytes::from(bytes)).await);
-                    }
-                    Sink::Ws(ws) => {
-                        allow_err!(ws.send(tungstenite::Message::Binary(Bytes::from(bytes))).await);
-                    }
-                }
-            }
+        if let Some(conn_tx) = self.tcp_punch.lock().await.get(&try_into_v4(addr)).cloned() {
+            send_to_conn(&conn_tx, msg);
+        } else {
+            log::debug!("No punch socket for {:?}", addr);
         }
     }
 
+    /// Deliver a message to a peer by id: its TCP-mediator connection when it registered
+    /// one, otherwise its registered UDP address.
     #[inline]
-    async fn send_to_tcp_sync(
-        &mut self,
-        msg: RendezvousMessage,
-        addr: SocketAddr,
-    ) -> ResultType<()> {
-        let mut sink = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
-        Self::send_to_sink(&mut sink, msg).await;
-        Ok(())
+    async fn send_to_peer(&mut self, id: String, msg: RendezvousMessage) {
+        if let Some(conn_tx) = self.mediators.lock().await.get(&id).cloned() {
+            send_to_conn(&conn_tx, msg);
+        } else if let Some(peer) = self.pm.get_in_memory(&id).await {
+            let peer_addr = peer.read().await.socket_addr;
+            self.tx.send(Data::Msg(msg.into(), peer_addr)).ok();
+        } else {
+            log::debug!("No route to peer {}", id);
+        }
+    }
+
+    /// Refresh a mediator's registration: every frame it sends proves it is alive, and
+    /// the freshness check of a punch request at it reads this.
+    #[inline]
+    async fn touch_mediator(&self, id: &str) {
+        if let Some(peer) = self.pm.get_in_memory(id).await {
+            peer.write().await.last_reg_time = Instant::now();
+        }
     }
 
     #[inline]
@@ -948,31 +1152,343 @@ impl RendezvousServer {
         key: &str,
         ws: bool,
     ) -> ResultType<()> {
-        let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
-        if let Some(addr) = to_addr {
-            self.tx.send(Data::Msg(msg.into(), addr))?;
-        } else {
-            self.send_to_tcp_sync(msg, addr).await?;
+        let (msg, to_id) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
+        match to_id {
+            Some(id) => self.send_to_peer(id, msg).await,
+            None => self.send_to_tcp(msg, addr).await,
         }
         Ok(())
     }
 
+    /// Route a WebRTC ICE candidate: the controlled peer addresses it to the controller
+    /// by id, the controller returns candidates on its punch socket by the return route
+    /// its request arrived on.
     #[inline]
-    async fn handle_udp_punch_hole_request(
-        &mut self,
-        addr: SocketAddr,
-        ph: PunchHoleRequest,
-        key: &str,
-    ) -> ResultType<()> {
-        let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, false).await?;
-        self.tx.send(Data::Msg(
-            msg.into(),
-            match to_addr {
-                Some(addr) => addr,
-                None => addr,
-            },
-        ))?;
+    async fn handle_ice_candidate(&mut self, ic: IceCandidate) -> ResultType<()> {
+        if ic.session_key.is_empty()
+            || ic.session_key.len() > MAX_ICE_SESSION_KEY_LEN
+            || ic.candidate.is_empty()
+            || ic.candidate.len() > MAX_ICE_CANDIDATE_LEN
+        {
+            bail!(
+                "invalid ice candidate (session_key {} bytes, candidate {} bytes)",
+                ic.session_key.len(),
+                ic.candidate.len()
+            );
+        }
+        if !ic.id.is_empty() {
+            self.send_to_peer(
+                ic.id.clone(),
+                RendezvousMessage {
+                    union: Some(rendezvous_message::Union::IceCandidate(ic)),
+                    ..Default::default()
+                },
+            )
+            .await;
+            return Ok(());
+        }
+        let addr = AddrMangle::decode(&ic.socket_addr);
+        let mut msg_out = RendezvousMessage::new();
+        msg_out.set_ice_candidate(ic);
+        self.send_to_tcp(msg_out, addr).await;
         Ok(())
+    }
+
+    /// RegisterPk over TCP: a full registration (with pk) makes this connection the
+    /// peer's TCP mediator — messages routed to it then travel here, kept alive by a
+    /// heartbeat, while its liveness keeps refreshing the peer's registration. An empty
+    /// pk is the id-change probe of the client UI (`check_id`): it only asks whether the
+    /// new id is available, and renames the record when it is.
+    async fn handle_register_pk(
+        &mut self,
+        rk: RegisterPk,
+        conn_tx: &ConnSender,
+        addr: SocketAddr,
+        mediator_id: &mut Option<String>,
+    ) {
+        let id = rk.id.clone();
+        if rk.pk.is_empty() {
+            self.handle_check_id(rk, conn_tx, addr).await;
+            return;
+        }
+        if rk.uuid.is_empty() || rk.id.is_empty() {
+            // Neither register nor probe; not an error worth a reply.
+            return;
+        }
+        let ip = addr.ip().to_string();
+        if id.len() < 6 || id.len() > MAX_PEER_ID_LEN {
+            send_rk_res_tcp(conn_tx, UUID_MISMATCH, 0);
+            return;
+        } else if !self.check_ip_blocker(&ip, &id).await {
+            send_rk_res_tcp(conn_tx, TOO_FREQUENT, 0);
+            return;
+        }
+        let peer = self.pm.get_or(&id).await;
+        let (changed, ip_changed) = {
+            let peer = peer.read().await;
+            if peer.uuid.is_empty() {
+                (true, false)
+            } else {
+                if peer.uuid == rk.uuid {
+                    if peer.info.ip != ip && peer.pk != rk.pk {
+                        log::warn!(
+                            "Peer {} ip/pk mismatch: {}/{:?} vs {}/{:?}",
+                            id,
+                            ip,
+                            rk.pk,
+                            peer.info.ip,
+                            peer.pk,
+                        );
+                        drop(peer);
+                        send_rk_res_tcp(conn_tx, UUID_MISMATCH, 0);
+                        return;
+                    }
+                } else {
+                    log::warn!(
+                        "Peer {} uuid mismatch: {:?} vs {:?}",
+                        id,
+                        rk.uuid,
+                        peer.uuid
+                    );
+                    drop(peer);
+                    send_rk_res_tcp(conn_tx, UUID_MISMATCH, 0);
+                    return;
+                }
+                let ip_changed = peer.info.ip != ip;
+                (
+                    peer.uuid != rk.uuid || peer.pk != rk.pk || ip_changed,
+                    ip_changed,
+                )
+            }
+        };
+        let mut req_pk = peer.read().await.reg_pk;
+        if req_pk.1.elapsed().as_secs() > 6 {
+            req_pk.0 = 0;
+        } else if req_pk.0 > 2 {
+            send_rk_res_tcp(conn_tx, TOO_FREQUENT, 0);
+            return;
+        }
+        req_pk.0 += 1;
+        req_pk.1 = Instant::now();
+        peer.write().await.reg_pk = req_pk;
+        if ip_changed {
+            let mut lock = IP_CHANGES.lock().await;
+            if let Some((tm, ips)) = lock.get_mut(&id) {
+                if tm.elapsed().as_secs() > IP_CHANGE_DUR {
+                    *tm = Instant::now();
+                    ips.clear();
+                    ips.insert(ip.clone(), 1);
+                } else if let Some(v) = ips.get_mut(&ip) {
+                    *v += 1;
+                } else {
+                    ips.insert(ip.clone(), 1);
+                }
+            } else {
+                lock.insert(
+                    id.clone(),
+                    (Instant::now(), HashMap::from([(ip.clone(), 1)])),
+                );
+            }
+        }
+        if changed {
+            let res = self
+                .pm
+                .update_pk(id.clone(), peer, addr, rk.uuid, rk.pk, ip)
+                .await;
+            if res != register_pk_response::Result::OK {
+                send_rk_res_tcp(conn_tx, res, 0);
+                return;
+            }
+        } else {
+            // Unchanged pk still has to make this connection the peer's live
+            // registration: a TCP mediator has no other register flow.
+            let mut w = peer.write().await;
+            w.socket_addr = addr;
+            w.last_reg_time = Instant::now();
+        }
+        send_rk_res_tcp(
+            conn_tx,
+            register_pk_response::Result::OK,
+            MEDIATOR_KEEP_ALIVE_SECS,
+        );
+        self.mediators.lock().await.insert(id.clone(), conn_tx.clone());
+        *mediator_id = Some(id);
+    }
+
+    /// The empty-pk RegisterPk of `check_id`: the client UI asks whether an id is
+    /// available (old_id empty) or renames its record to a new id (old_id set). The
+    /// uuid must own the old record, and the new id must not belong to anyone else.
+    async fn handle_check_id(&mut self, rk: RegisterPk, conn_tx: &ConnSender, addr: SocketAddr) {
+        if rk.uuid.is_empty() || rk.id.is_empty() {
+            return;
+        }
+        let ip = addr.ip().to_string();
+        if rk.id.len() < 6 || rk.id.len() > MAX_PEER_ID_LEN {
+            send_rk_res_tcp(conn_tx, register_pk_response::Result::INVALID_ID_FORMAT, 0);
+            return;
+        }
+        if !self.check_ip_blocker(&ip, &rk.id).await {
+            send_rk_res_tcp(conn_tx, TOO_FREQUENT, 0);
+            return;
+        }
+        if rk.old_id.is_empty() {
+            // Availability probe: an id taken by another uuid is not available.
+            let res = match self.pm.get(&rk.id).await {
+                Some(peer) => {
+                    if peer.read().await.uuid.is_empty() {
+                        register_pk_response::Result::OK
+                    } else {
+                        register_pk_response::Result::ID_EXISTS
+                    }
+                }
+                None => register_pk_response::Result::OK,
+            };
+            send_rk_res_tcp(conn_tx, res, 0);
+            return;
+        }
+        let res = self.rename_id(&rk).await;
+        send_rk_res_tcp(conn_tx, res, 0);
+    }
+
+    /// Rebinds a peer's record to its new id: the uuid must own the old record, the new
+    /// id must be free, then the database row and any in-memory entry both move so
+    /// routing and freshness checks follow immediately.
+    async fn rename_id(&mut self, rk: &RegisterPk) -> register_pk_response::Result {
+        let Some(old) = self.pm.get(&rk.old_id).await else {
+            return register_pk_response::Result::UUID_MISMATCH;
+        };
+        let (guid, uuid, pk, info_str) = {
+            let r = old.read().await;
+            (
+                r.guid.clone(),
+                r.uuid.clone(),
+                r.pk.clone(),
+                serde_json::to_string(&r.info).unwrap_or_default(),
+            )
+        };
+        if guid.is_empty() || uuid.is_empty() || uuid != rk.uuid {
+            return register_pk_response::Result::UUID_MISMATCH;
+        }
+        if let Some(owned) = self.pm.get(&rk.id).await {
+            if !owned.read().await.uuid.is_empty() {
+                return register_pk_response::Result::ID_EXISTS;
+            }
+        }
+        if let Err(err) = self.pm.db.update_pk(&guid, &rk.id, &pk, &info_str).await {
+            log::error!("db.update_pk failed: {}", err);
+            return register_pk_response::Result::SERVER_ERROR;
+        }
+        self.pm.move_peer(&rk.old_id, &rk.id).await;
+        register_pk_response::Result::OK
+    }
+
+    /// Forward an HttpProxyRequest to the API server on loopback: the client tunnels
+    /// its API calls through hbbs when it can only reach the rendezvous port. The
+    /// destination is fixed, the path is validated above, and the whole exchange is
+    /// time- and size-bounded, so a hung or runaway origin cannot pin the task or the
+    /// connection.
+    async fn handle_http_proxy_request(&self, req: HttpProxyRequest, conn_tx: ConnSender) {
+        if !allowed_proxy_method(&req.method) {
+            log::warn!("HttpProxyRequest with a disallowed method: {}", req.method);
+            send_http_proxy_error(&conn_tx, "Unsupported method");
+            return;
+        }
+        if !validate_proxy_path(&req.path) {
+            log::warn!("HttpProxyRequest with an invalid path ({} bytes)", req.path.len());
+            send_http_proxy_error(&conn_tx, "Invalid path");
+            return;
+        }
+        let url = format!("{}{}", self.inner.api_origin, req.path);
+        let origin = self.inner.api_origin.clone();
+        tokio::spawn(async move {
+            let resp = Self::proxy_request(req, url, origin).await;
+            let mut msg_out = RendezvousMessage::new();
+            msg_out.set_http_proxy_response(resp);
+            send_to_conn(&conn_tx, msg_out);
+        });
+    }
+
+    async fn proxy_request(
+        req: HttpProxyRequest,
+        url: String,
+        origin: String,
+    ) -> HttpProxyResponse {
+        let mut resp = HttpProxyResponse::new();
+        let method = match req.method.parse::<reqwest::Method>() {
+            Ok(m) => m,
+            Err(_) => {
+                resp.error = format!("Invalid method: {}", req.method);
+                return resp;
+            }
+        };
+        let client = match reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_millis(HTTP_PROXY_TIMEOUT_MS))
+            .build()
+        {
+            Ok(c) => c,
+            Err(err) => {
+                resp.error = format!("Failed to build client: {}", err);
+                return resp;
+            }
+        };
+        let _ = origin;
+        let mut request = client.request(method, &url);
+        for h in req.headers.iter() {
+            let name = h.name.to_ascii_lowercase();
+            if is_hop_by_hop_header(&name) || name == "host" || name == "content-length" {
+                continue;
+            }
+            if let (Ok(name), Ok(value)) = (
+                reqwest::header::HeaderName::from_bytes(h.name.as_bytes()),
+                reqwest::header::HeaderValue::from_str(&h.value),
+            ) {
+                request = request.header(name, value);
+            }
+        }
+        if !req.body.is_empty() {
+            request = request.body(req.body.to_vec());
+        }
+        let Ok(mut response) = request.send().await else {
+            resp.error = format!("Failed to reach {}", origin);
+            return resp;
+        };
+        resp.status = response.status().as_u16() as i32;
+        for (name, value) in response.headers().iter() {
+            if is_hop_by_hop_header(name.as_str()) {
+                continue;
+            }
+            if let Ok(value) = value.to_str() {
+                resp.headers.push(HeaderEntry {
+                    name: name.as_str().to_owned(),
+                    value: value.to_owned(),
+                    ..Default::default()
+                });
+            }
+        }
+        let mut body = Vec::new();
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    if body.len() + chunk.len() > MAX_HTTP_PROXY_BODY {
+                        resp.error = format!(
+                            "The response exceeds {} bytes",
+                            MAX_HTTP_PROXY_BODY
+                        );
+                        return resp;
+                    }
+                    body.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    resp.error = format!("Failed to read the body: {}", err);
+                    return resp;
+                }
+            }
+        }
+        resp.body = body.into();
+        resp
     }
 
     async fn check_ip_blocker(&self, ip: &str, id: &str) -> bool {
@@ -1140,7 +1656,7 @@ impl RendezvousServer {
                 let arg = fds.next();
                 if let Some("-") = arg { lock.clear(); }
                 else {
-                    let mut start = arg.and_then(|x| x.parse::<usize>().ok()).unwrap_or(0);
+                    let start = arg.and_then(|x| x.parse::<usize>().ok()).unwrap_or(0);
                     let mut page_size = fds.next().and_then(|x| x.parse::<usize>().ok()).unwrap_or(10);
                     if page_size == 0 { page_size = 10; }
                     for (_, e) in lock.iter().enumerate().skip(start).take(page_size) {
@@ -1243,7 +1759,14 @@ impl RendezvousServer {
     }
 
     /// Processes rendezvous messages on an accepted TCP or WebSocket connection.
-    #[inline]
+    ///
+    /// The connection task is the sole writer: everything anyone wants to say to this
+    /// peer goes through its channel, so frames never interleave and encryption, once a
+    /// key exchange completed, is applied in order. A fresh non-WebSocket connection is
+    /// offered a key exchange as the very first frame; the first inbound frame then
+    /// decides the mode — a `KeyExchange` reply encrypts the stream, anything else is a
+    /// client from before the exchange and is processed in the clear. WebSocket skips
+    /// the exchange: wss already encrypts the transport.
     async fn handle_listener_inner(
         &mut self,
         stream: TcpStream,
@@ -1251,8 +1774,7 @@ impl RendezvousServer {
         key: &str,
         ws: bool,
     ) -> ResultType<()> {
-        let mut sink;
-        if ws {
+        let (mut sink, mut source) = if ws {
             use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
             let callback = |req: &Request, response: Response| {
                 let headers = req.headers();
@@ -1286,28 +1808,143 @@ impl RendezvousServer {
                 tokio_tungstenite::accept_hdr_async_with_config(stream, callback, Some(ws_config)),
             )
             .await??;
-            let (a, mut b) = ws_stream.split();
-            sink = Some(Sink::Ws(a));
-            while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
-                if let tungstenite::Message::Binary(bytes) = msg {
-                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
-                        break;
-                    }
-                }
-            }
+            let (a, b) = ws_stream.split();
+            (Sink::Ws(a), Source::Ws(b))
         } else {
             let mut framed = Framed::new(stream, BytesCodec::new());
             framed.codec_mut().set_max_packet_length(*MAX_MESSAGE);
-            let (a, mut b) = framed.split();
-            sink = Some(Sink::TcpStream(a));
-            while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
-                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
-                    break;
+            let (a, b) = framed.split();
+            (Sink::TcpStream(a), Source::TcpStream(b))
+        };
+
+        let (conn_tx, mut conn_rx) = mpsc::channel::<Bytes>(MAX_CONN_QUEUE);
+
+        // The offer, gated on having a server key like the signed-pk paths. A client
+        // that cannot answer it reads the frame, does not recognize it, and carries
+        // on in the clear; the first inbound frame below tells the two apart.
+        let mut kx = None;
+        if !ws {
+            if let Some(sk) = self.inner.sk.as_ref() {
+                match build_kx_offer(sk) {
+                    Ok((msg, eph_sk, responder_pk)) => match msg.write_to_bytes() {
+                        Ok(bytes) => {
+                            if let Err(err) = sink.send_bytes(Bytes::from(bytes)).await {
+                                log::debug!(
+                                    "Failed to send the key exchange offer to {:?}: {}",
+                                    addr,
+                                    err
+                                );
+                                self.tcp_punch.lock().await.remove(&try_into_v4(addr));
+                                log::debug!("Tcp connection from {:?} closed", addr);
+                                return Ok(());
+                            }
+                            kx = Some((eph_sk, responder_pk));
+                        }
+                        Err(err) => log::error!("Failed to encode the key exchange offer: {}", err),
+                    },
+                    Err(err) => log::error!("Failed to build the key exchange offer: {}", err),
                 }
             }
         }
-        if sink.is_none() {
-            self.tcp_punch.lock().await.remove(&try_into_v4(addr));
+
+        let mut enc: Option<Encrypt> = None;
+        let mut mediator_id: Option<String> = None;
+        // A mediator's keep-alive comes from this side, as an empty frame the client
+        // echoes back; the echo refreshes the registration. The first tick fires
+        // before any registration, as a no-op, and a delayed tick skips rather than
+        // bursts after a long inline proxy request has held the loop.
+        let mut timer_heartbeat = interval(Duration::from_secs(MEDIATOR_HEARTBEAT_SECS));
+        timer_heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                res = timeout(CONN_READ_TIMEOUT_MS, source.next_frame()) => {
+                    let mut bytes = match res {
+                        Ok(Some(Ok(bytes))) => bytes,
+                        Ok(Some(Err(err))) => {
+                            log::debug!("Read failure on connection {:?}: {}", addr, err);
+                            break;
+                        }
+                        Ok(None) => break,
+                        Err(_) => {
+                            log::debug!("Read timeout on connection {:?}", addr);
+                            break;
+                        }
+                    };
+                    if let Some(enc) = enc.as_mut() {
+                        if let Err(err) = enc.dec(&mut bytes) {
+                            log::warn!("Decryption failure on connection {:?}: {}", addr, err);
+                            break;
+                        }
+                    }
+                    if let Some((eph_sk, responder_pk)) = kx.take() {
+                        // Only the very first frame can answer the offer. A reply
+                        // switches to encrypted mode and is not a rendezvous
+                        // message; anything else falls through as the client's
+                        // first plaintext message.
+                        if let Ok(msg) = RendezvousMessage::parse_from_bytes(&bytes) {
+                            if let Some(rendezvous_message::Union::KeyExchange(ex)) = msg.union {
+                                match complete_kx(&ex, &eph_sk, &responder_pk) {
+                                    Ok(e) => {
+                                        enc = Some(e);
+                                        log::info!("Connection secured for {:?}", addr);
+                                        continue;
+                                    }
+                                    Err(err) => {
+                                        log::warn!(
+                                            "Key exchange with {:?} failed: {}",
+                                            addr,
+                                            err
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(id) = mediator_id.as_ref() {
+                        self.touch_mediator(id).await;
+                    }
+                    if !self.handle_tcp(&bytes, &conn_tx, addr, key, ws, &mut mediator_id).await {
+                        break;
+                    }
+                }
+                Some(bytes) = conn_rx.recv() => {
+                    let bytes = if let Some(enc) = enc.as_mut() {
+                        Bytes::from(enc.enc(&bytes))
+                    } else {
+                        bytes
+                    };
+                    if let Err(err) = sink.send_bytes(bytes).await {
+                        log::debug!("Write failure on connection {:?}: {}", addr, err);
+                        break;
+                    }
+                }
+                _ = timer_heartbeat.tick() => {
+                    if let Some(id) = mediator_id.as_ref() {
+                        if let Err(mpsc::error::TrySendError::Full(_)) =
+                            conn_tx.try_send(Bytes::new())
+                        {
+                            log::warn!("Heartbeat to mediator {} dropped: full queue", id);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Whatever this connection registered under goes with it. The mediator entry is
+        // only removed when it is still ours: a reconnecting peer has already replaced
+        // it with its own channel, and that one must survive.
+        self.tcp_punch.lock().await.remove(&try_into_v4(addr));
+        if let Some(id) = mediator_id.as_ref() {
+            let mut mediators = self.mediators.lock().await;
+            let mine = mediators
+                .get(id)
+                .map(|tx| tx.same_channel(&conn_tx))
+                .unwrap_or(false);
+            if mine {
+                mediators.remove(id);
+            }
         }
         log::debug!("Tcp connection from {:?} closed", addr);
         Ok(())
@@ -1322,7 +1959,7 @@ impl RendezvousServer {
                 Some(peer) => {
                     let pk = peer.read().await.pk.clone();
                     sign::sign(
-                        &hbb_common::message_proto::IdPk {
+                        &IdPk {
                             id,
                             pk,
                             ..Default::default()
@@ -1462,6 +2099,33 @@ async fn send_rk_res(
         ..Default::default()
     });
     socket.send(&msg_out, addr).await
+}
+
+/// RegisterPkResponse for a TCP/WebSocket connection: queued onto the connection task
+/// rather than written inline, so it is encrypted when a key exchange completed and
+/// never interleaves with another frame. `keep_alive` tells the client how often it
+/// must send to keep its registration alive.
+#[inline]
+fn send_rk_res_tcp(conn_tx: &ConnSender, res: register_pk_response::Result, keep_alive: i32) {
+    let mut msg_out = RendezvousMessage::new();
+    msg_out.set_register_pk_response(RegisterPkResponse {
+        result: res.into(),
+        keep_alive,
+        ..Default::default()
+    });
+    send_to_conn(conn_tx, msg_out);
+}
+
+/// HttpProxyResponse carrying only an error string, for the paths that fail before or
+/// during the proxied request.
+#[inline]
+fn send_http_proxy_error(conn_tx: &ConnSender, error: &str) {
+    let mut msg_out = RendezvousMessage::new();
+    msg_out.set_http_proxy_response(HttpProxyResponse {
+        error: error.to_owned(),
+        ..Default::default()
+    });
+    send_to_conn(conn_tx, msg_out);
 }
 
 async fn create_udp_listener(

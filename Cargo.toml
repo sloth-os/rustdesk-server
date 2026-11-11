@@ -60,9 +60,19 @@ reqwest = { git = "https://github.com/rustdesk-org/reqwest", features = ["blocki
 
 [target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.dependencies]
 reqwest = { git = "https://github.com/rustdesk-org/reqwest", features = ["blocking", "socks", "json", "rustls-tls", "rustls-tls-native-roots", "gzip"], default-features=false }
+# The pinned hbb_common enables tokio-native-tls (and tungstenite's native-tls feature)
+# unconditionally, so every Linux build links openssl-sys — and the cross musl images ship
+# no OpenSSL. Nothing here calls native-tls directly: as a dependency of this package its
+# `vendored` feature unifies across the graph and builds OpenSSL from source for every
+# native-tls user. mac/win are unaffected (schannel / security-framework).
+native-tls = { version = "0.2", features = ["vendored"] }
 
 [build-dependencies]
 hbb_common = { path = "libs/hbb_common" }
+# Resolver v2 keeps build-dep features separate from normal deps, so the host-side copy of
+# hbb_common (pulled in by build.rs for gen_version) would resolve native-tls without
+# `vendored` and probe the build container for a system OpenSSL that isn't there.
+native-tls = { version = "0.2", features = ["vendored"] }
 
 [workspace]
 members = ["libs/hbb_common"]
